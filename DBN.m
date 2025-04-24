@@ -1,53 +1,84 @@
 classdef DBN < handle
-    %DBN Summary of this class goes here
-    %   Detailed explanation goes here
-    
+    % DBN: Deep Belief Network for MNIST classification/generation.
+    % Pre-trains RBMs layer-wise using Contrastive Divergence.
+
     properties
-        sizes
-        rbm = BernoulliRBM;
+        sizes    % Layer sizes [nVis, hidden1, hidden2, ...]
+        rbm      % Array of RBMs (BernoulliRBM and SoftmaxRBM)
     end
     
     methods
         function dbn = DBN(x, y, sizes, opts)
-            n = size(x, 2);
-            m = size(y, 2);
-            dbn.sizes = [n, sizes];
-            nLayers = numel(dbn.sizes) - 1;
-            for i = 1 : nLayers - 1
-                dbn.rbm(i) = BernoulliRBM(dbn.sizes(i), dbn.sizes(i + 1), opts);
-            end
-            
-            % for the final layer of the dbn we add some additional
-            % parameters for modelling the joint distribution of the inputs and target classes
-            dbn.rbm(nLayers) = SoftmaxRBM(dbn.sizes(nLayers), dbn.sizes(nLayers + 1), opts, m);
+            % Constructor: Initialize DBN with layer sizes and options.
+            % Inputs: x - Features [nSamples, nFeatures]
+            %         y - Labels [nSamples, nClasses]
+            %         sizes - Hidden layer sizes
+            %         opts - Training options
+            n_features = size(x, 2);
+            n_classes = size(y, 2);
+            dbn.sizes = [n_features, sizes]; % Full architecture
+            n_layers = numel(dbn.sizes) - 1;
 
+            % Initialize lower RBMs (BernoulliRBM)
+            for layer_idx = 1:n_layers-1
+                dbn.rbm(layer_idx) = BernoulliRBM(dbn.sizes(layer_idx), ...
+                                                 dbn.sizes(layer_idx + 1), opts);
+            end
+
+            % Initialize top RBM (SoftmaxRBM) with labels
+            dbn.rbm(n_layers) = SoftmaxRBM(dbn.sizes(n_layers), ...
+                                          dbn.sizes(n_layers + 1), opts, n_classes);
         end
 
         function train(dbn, x, y)
-            n = numel(dbn.rbm);
-            for i = 1 : n-1
-                train(dbn.rbm(i), x);
-                x = rbmup(dbn.rbm(i), x);
+            % Train the DBN using greedy layer-wise pre-training.
+            % Inputs: x - Features [nSamples, nFeatures]
+            %         y - Labels [nSamples, nClasses]
+
+            n_layers = numel(dbn.rbm);
+            current_data = x;
+
+            % Train each lower RBM
+            for layer_idx = 1:n_layers-1
+                % Train current RBM on input data
+                fprintf('Training RBM %d (%d -> %d)...\n', ...
+                        layer_idx, dbn.sizes(layer_idx), dbn.sizes(layer_idx + 1));
+                train(dbn.rbm(layer_idx), current_data);
+
+                % Compute hidden activations for next layer
+                current_data = rbmup(dbn.rbm(layer_idx), current_data);
+                % current_data: [nSamples, nHidden] for next RBM
             end
-            train(dbn.rbm(n), x, y);
+
+            % Train top RBM with features and labels
+            fprintf('Training top RBM (%d -> %d, with %d classes)...\n', ...
+                    dbn.sizes(n_layers), dbn.sizes(n_layers + 1), size(y, 2));
+            train(dbn.rbm(n_layers), current_data, y);
         end
         
         function probs = predict(dbn, x, y)
-            n = numel(dbn.rbm);
-            m = size(y, 1);
-            c = size(y, 2);
-            % do an upward pass through the network for the test examples
-            % to compute the feature activations in the penultimate layer
-            for i = 2 : n
-                x = rbmup(dbn.rbm(i - 1), x);
+            % Predict class probabilities for test data.
+            % Inputs: x - Test features [nSamples, nFeatures]
+            %         y - Test labels [nSamples, nClasses]
+            % Output: probs - Class probabilities [nSamples, nClasses]
+
+            n_layers = numel(dbn.rbm);
+            n_samples = size(y, 1);
+            n_classes = size(y, 2);
+            current_data = x;
+
+            % Propagate through lower layers to get penultimate activations
+            for layer_idx = 2:n_layers
+                current_data = rbmup(dbn.rbm(layer_idx - 1), current_data);
             end
-            
-            % precompute for efficiency
-            precom = repmat(dbn.rbm(n).c', m, 1) + x * dbn.rbm(n).W';
-            probs = zeros(m,c, 'gpuArray');
-            % probablities aren't normalized
-            for i = 1:c
-                probs(:, i) = exp(dbn.rbm(n).d(i)) * prod(1 + exp(precom + repmat(dbn.rbm(n).U(:, i)', m, 1)), 2);
+
+            % Compute unnormalized probabilities for each class
+            precom = repmat(dbn.rbm(n_layers).c', n_samples, 1) + ...
+                    current_data * dbn.rbm(n_layers).W';
+            probs = zeros(n_samples, n_classes, 'gpuArray');
+            for class_idx = 1:n_classes
+                probs(:, class_idx) = exp(dbn.rbm(n_layers).d(class_idx)) * ...
+                    prod(1 + exp(precom + repmat(dbn.rbm(n_layers).U(:, class_idx)', n_samples, 1)), 2);
             end
         end
 
