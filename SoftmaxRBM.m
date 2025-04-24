@@ -1,90 +1,125 @@
 classdef SoftmaxRBM < BernoulliRBM & handle
-    %RBM Summary of this class goes here
-    %   Detailed explanation goes here
-    
+    % SoftmaxRBM: RBM with binary hidden units, binary visible units, and softmax label units.
+    % Models joint distribution of features and labels (e.g., MNIST digits).
+
     properties
-        U
-        vU
-        
-        d
-        vd
+        U        % Softmax-to-hidden weights [nHidden, nClasses]
+        vU       % Momentum for U
+        d        % Softmax bias [nClasses, 1]
+        vd       % Momentum for d
     end
-    
+
     methods
         function rbm = SoftmaxRBM(nVis, nHidden, opts, nClasses)
+            % Constructor: Initialize RBM with softmax units for labels.
+            % Inputs: nVis - Visible units (features)
+            %         nHidden - Hidden units
+            %         opts - Training options
+            %         nClasses - Number of label classes
             rbm@BernoulliRBM(nVis, nHidden, opts);
-
-            % bias for softmax units
-            rbm.d = zeros(nClasses, 1, 'gpuArray');
-            rbm.vd = zeros(nClasses, 1, 'gpuArray');
-            % weights for softmax-to-hidden connections
-            rbm.U = zeros(nHidden, nClasses, 'gpuArray');
-            rbm.vU = zeros(nHidden, nClasses);
+            rbm.d = zeros(nClasses, 1, 'gpuArray');    % Softmax bias
+            rbm.vd = zeros(nClasses, 1, 'gpuArray');   % Bias momentum
+            rbm.U = zeros(nHidden, nClasses, 'gpuArray'); % Softmax weights
+            rbm.vU = zeros(nHidden, nClasses, 'gpuArray'); % Weights momentum
         end
-       
-        
+
         function rbm = train(rbm, x, y)
-            assert(isfloat(x), 'x must be a float');
-            assert(all(x(:)>=0) && all(x(:)<=1), 'all data in x must be in [0:1]');
-            m = size(x, 1);
-                      
-            batchsize = rbm.opts.batchsize;
-            numepochs = rbm.opts.numepochs;
-            alpha = rbm.opts.alpha;
+            % Train the RBM to model joint distribution of features and labels.
+            % Inputs: x - Features [nSamples, nVis], values in [0,1]
+            %         y - One-hot labels [nSamples, nClasses]
+
+            % Validate inputs
+            assert(isfloat(x), 'Feature data must be a float.');
+            assert(all(x(:) >= 0) && all(x(:) <= 1), 'Feature data must be in [0,1].');
+            n_samples = size(x, 1);
+
+            % Get training parameters
+            batch_size = rbm.opts.batchsize;
+            n_epochs = rbm.opts.numepochs;
+            learning_rate = rbm.opts.alpha;
             momentum = rbm.opts.momentum;
-            decay = rbm.opts.decay;
-            k = rbm.opts.k;
-          
-            numbatches = m / batchsize;
-            assert(rem(numbatches, 1) == 0, 'numbatches not integer');
+            weight_decay = rbm.opts.decay;
+            cd_steps = rbm.opts.k;
+            n_batches = n_samples / batch_size;
+
+            % Ensure batch size divides data evenly
+            assert(rem(n_batches, 1) == 0, 'Number of batches must be an integer.');
+
+            % Move data to GPU
             x = gpuArray(x);
-            for i = 1 : numepochs
-                kk = randperm(m);
-                for l = 1 : numbatches
-                    batch =  x(kk((l - 1) * batchsize + 1 : l * batchsize), :);
-                    labels = y(kk((l - 1) * batchsize + 1 : l * batchsize), :);
+            y = gpuArray(y);
 
-                    % positive phase
-                    v1 = gpuArray(batch);
-                    y1 = gpuArray(labels);
+            % Loop over epochs
+            for epoch_idx = 1:n_epochs
+                % Shuffle data indices for random mini-batches
+                shuffled_indices = randperm(n_samples);
 
-                    h1 = RBM.sample(repmat(rbm.c', batchsize, 1) + v1 * rbm.W' + y1 * rbm.U');
+                % Process each mini-batch
+                for batch_idx = 1:n_batches
+                    % Extract mini-batch
+                    batch_start = (batch_idx - 1) * batch_size + 1;
+                    batch_end = batch_idx * batch_size;
+                    batch_indices = shuffled_indices(batch_start:batch_end);
+                    visible_pos = x(batch_indices, :); % Feature batch
+                    labels_pos = y(batch_indices, :);  % Label batch
 
-                    if i == 1 && l == 1
-                        h2 = h1;
+                    % Positive phase: Compute hidden states from features and labels
+                    hidden_pos = RBM.sample(repmat(rbm.c', batch_size, 1) + ...
+                                           visible_pos * rbm.W' + labels_pos * rbm.U');
+                    % hidden_pos: [batch_size, nHidden], binary samples
+
+                    % Initialize persistent chain
+                    if epoch_idx == 1 && batch_idx == 1
+                        hidden_neg = hidden_pos;
                     end
-                    
-                    % negative phase
-                    for j = 1:k
-                        y2 = softmax(repmat(rbm.d', batchsize, 1) + h2 * rbm.U);
-                        v2 = RBM.sample(repmat(rbm.b', batchsize, 1) + h2 * rbm.W);
-                        h2 = RBM.sample(repmat(rbm.c', batchsize, 1) + v2 * rbm.W' + y2 * rbm.U');
+
+                    % Negative phase: Perform k steps of Gibbs sampling
+                    for step = 1:cd_steps
+                        % Sample labels using softmax
+                        labels_neg = softmax(repmat(rbm.d', batch_size, 1) + ...
+                                           hidden_neg * rbm.U);
+                        % Reconstruct features
+                        visible_neg = RBM.sample(repmat(rbm.b', batch_size, 1) + ...
+                                                hidden_neg * rbm.W);
+                        % Recompute hidden states
+                        hidden_neg = RBM.sample(repmat(rbm.c', batch_size, 1) + ...
+                                               visible_neg * rbm.W' + labels_neg * rbm.U');
                     end
-                    
-                    c1 = h1' * v1;
-                    c2 = h2' * v2;
 
-                    d1 = h1' * y1;
-                    d2 = h2' * y2;
+                    % Compute gradients
+                    pos_stats_features = hidden_pos' * visible_pos; % [nHidden, nVis]
+                    neg_stats_features = hidden_neg' * visible_neg;
+                    pos_stats_labels = hidden_pos' * labels_pos; % [nHidden, nClasses]
+                    neg_stats_labels = hidden_neg' * labels_neg;
 
-                    % compute weight updates
-                    rbm.vW = momentum * rbm.vW + alpha * (c1 - c2 - decay * rbm.W) / batchsize;
-                    rbm.vU = momentum * rbm.vU + alpha * (d1 - d2 - decay * rbm.U) / batchsize;
-                    rbm.vb = momentum * rbm.vb + alpha * (sum(v1 - v2)' - decay * rbm.b)     / batchsize;
-                    rbm.vc = momentum * rbm.vc + alpha * (sum(h1 - h2)' - decay * rbm.c) / batchsize;
-                    rbm.vd = momentum * rbm.vd + alpha * (sum(y1 - y2)' - decay * rbm.d)     / batchsize;
+                    % Update weights and biases with momentum
+                    rbm.vW = momentum * rbm.vW + ...
+                             learning_rate * (pos_stats_features - neg_stats_features - ...
+                                             weight_decay * rbm.W) / batch_size;
+                    rbm.vU = momentum * rbm.vU + ...
+                             learning_rate * (pos_stats_labels - neg_stats_labels - ...
+                                             weight_decay * rbm.U) / batch_size;
+                    rbm.vb = momentum * rbm.vb + ...
+                             learning_rate * (sum(visible_pos - visible_neg)' - ...
+                                             weight_decay * rbm.b) / batch_size;
+                    rbm.vc = momentum * rbm.vc + ...
+                             learning_rate * (sum(hidden_pos - hidden_neg)' - ...
+                                             weight_decay * rbm.c) / batch_size;
+                    rbm.vd = momentum * rbm.vd + ...
+                             learning_rate * (sum(labels_pos - labels_neg)' - ...
+                                             weight_decay * rbm.d) / batch_size;
 
-                    % update weights
+                    % Apply updates
                     rbm.W = rbm.W + rbm.vW;
                     rbm.U = rbm.U + rbm.vU;
                     rbm.b = rbm.b + rbm.vb;
                     rbm.c = rbm.c + rbm.vc;
                     rbm.d = rbm.d + rbm.vd;
-
                 end
-                fprintf('epoch %d / %d\n', i, numepochs);
+
+                % Show progress
+                fprintf('Epoch %d of %d completed for SoftmaxRBM.\n', epoch_idx, n_epochs);
             end
         end
     end
 end
-
